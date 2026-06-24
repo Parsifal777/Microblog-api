@@ -8,6 +8,9 @@ import com.microblog.repository.LikeRepository;
 import com.microblog.repository.PostRepository;
 import com.microblog.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -15,8 +18,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
-
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PostService {
@@ -26,6 +28,7 @@ public class PostService {
     private final LikeRepository likeRepository;
 
     @Transactional
+    @CacheEvict(value = "feed", allEntries = true)  // ❗ При создании поста — очищаем кэш ленты
     public PostResponse createPost(Long userId, PostRequest request) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new RuntimeException("User not found"));
@@ -35,11 +38,23 @@ public class PostService {
         post.setUser(user);
 
         Post saved = postRepository.save(post);
+        log.info("✅ Post created with ID: {}, cache feed cleared", saved.getId());
         return toResponse(saved, userId);
     }
 
-    // Используем JOIN FETCH для получения поста с пользователем
+    // ❗ Кэшируем ленту
+    @Cacheable(value = "feed", key = "#userId + '_' + #page + '_' + #size")
+    public Page<PostResponse> getFeed(Long userId, int page, int size) {
+        log.info("📡 Loading feed from DATABASE for user: {} (page: {}, size: {})", userId, page, size);
+        Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
+        Page<Post> posts = postRepository.findFeedPosts(userId, pageable);
+        return posts.map(post -> toResponse(post, userId));
+    }
+
+    // ❗ Кэшируем отдельный пост
+    @Cacheable(value = "post", key = "#postId")
     public PostResponse getPostById(Long postId, Long currentUserId) {
+        log.info("📡 Loading post from DATABASE: {}", postId);
         Post post = postRepository.findByIdWithUser(postId)
                 .orElseThrow(() -> new RuntimeException("Post not found"));
 
@@ -50,30 +65,11 @@ public class PostService {
         return toResponse(post, currentUserId);
     }
 
-    // Используем EntityGraph для JOIN FETCH
-    public List<PostResponse> getUserPosts(Long userId, Long currentUserId, int page, int size) {
-        Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
-        Page<Post> posts = postRepository.findByUserIdAndDeletedFalse(userId, pageable);
-        return posts.stream()
-                .map(post -> toResponse(post, currentUserId))
-                .toList();
-    }
-
+    // ❗ При обновлении поста — удаляем из кэша
     @Transactional
-    public void deletePost(Long postId, Long userId) {
-        Post post = postRepository.findById(postId)
-                .orElseThrow(() -> new RuntimeException("Post not found"));
-
-        if (!post.getUser().getId().equals(userId)) {
-            throw new RuntimeException("You can only delete your own posts");
-        }
-
-        post.setDeleted(true);
-        postRepository.save(post);
-    }
-
-    @Transactional
+    @CacheEvict(value = "post", key = "#postId")
     public PostResponse updatePost(Long postId, Long userId, PostRequest request) {
+        log.info("🔄 Updating post: {}, cache will be evicted", postId);
         Post post = postRepository.findById(postId)
                 .orElseThrow(() -> new RuntimeException("Post not found"));
 
@@ -84,23 +80,42 @@ public class PostService {
         post.setContent(request.content());
         Post updated = postRepository.save(post);
 
+        // Очищаем кэш ленты (так как изменился пост)
+        clearFeedCache();
+
         return toResponse(updated, userId);
     }
 
-    // Лента с JOIN FETCH
-    public Page<PostResponse> getFeed(Long userId, int page, int size) {
-        Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
-        Page<Post> posts = postRepository.findFeedPosts(userId, pageable);
-        return posts.map(post -> toResponse(post, userId));
+    // ❗ При удалении поста — удаляем из кэша
+    @Transactional
+    @CacheEvict(value = "post", key = "#postId")
+    public void deletePost(Long postId, Long userId) {
+        log.info("🗑️ Deleting post: {}, cache will be evicted", postId);
+        Post post = postRepository.findById(postId)
+                .orElseThrow(() -> new RuntimeException("Post not found"));
+
+        if (!post.getUser().getId().equals(userId)) {
+            throw new RuntimeException("You can only delete your own posts");
+        }
+
+        post.setDeleted(true);
+        postRepository.save(post);
+
+        // Очищаем кэш ленты
+        clearFeedCache();
     }
 
-    // Конвертация в DTO (уже использует данные из JOIN FETCH)
+    // Вспомогательный метод для очистки кэша ленты
+    private void clearFeedCache() {
+        log.info("🧹 Clearing feed cache");
+    }
+
     private PostResponse toResponse(Post post, Long currentUserId) {
         boolean isLiked = likeRepository.existsByUserIdAndPostIdAndDeletedFalse(currentUserId, post.getId());
         return new PostResponse(
                 post.getId(),
                 post.getContent(),
-                post.getUser().getUsername(),  // User уже загружен через JOIN FETCH
+                post.getUser().getUsername(),
                 post.getUser().getId(),
                 post.getLikesCount(),
                 isLiked,
